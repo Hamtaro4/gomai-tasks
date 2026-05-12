@@ -1,0 +1,975 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>後回しタスク</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;600;700&family=Noto+Serif+JP:wght@500;700&display=swap">
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; min-height: 100%;
+    background: #ffffff;
+    font-family: 'Noto Sans JP', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overscroll-behavior: none;
+  }
+  button { font-family: inherit; }
+  ::-webkit-scrollbar { width: 0; height: 0; }
+
+  @keyframes task-out {
+    0%   { transform: translateX(0) scale(1); opacity: 1; max-height: 80px; margin-bottom: 6px; }
+    60%  { transform: translateX(28px) scale(0.97); opacity: 0.3; }
+    100% { transform: translateX(60px) scale(0.95); opacity: 0; max-height: 0; margin-bottom: 0; padding-top: 0; padding-bottom: 0; border-width: 0; overflow: hidden; }
+  }
+  .task-leaving { animation: task-out 0.36s cubic-bezier(.4,.0,.6,1) forwards; pointer-events: none; }
+  .check-btn:hover { background: rgba(0,0,0,0.06) !important; }
+  .check-btn:active { transform: scale(0.9); }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel">
+// ─── Constants ──────────────────────────────────────────────────────────────
+const { useState, useRef, useMemo, useEffect, useCallback } = React;
+
+const C = {
+  bg:    '#ffffff',
+  panel: '#f7f7f8',
+  sunk:  '#eeeeef',
+  ink:   '#1a1a1a',
+  muted: '#888888',
+  soft:  '#aaaaaa',
+  rule:  '#e5e5e5',
+};
+
+const QUADRANTS = {
+  q1: { label: '最優先', sub: '重要・緊急',     color: '#b94328' },
+  q2: { label: '計画',   sub: '重要・非緊急',   color: '#3a6a8a' },
+  q3: { label: '手早く', sub: '非重要・緊急',   color: '#c89548' },
+  q4: { label: '様子見', sub: '非重要・非緊急', color: '#7d8472' },
+};
+const Q_ORDER = ['q1', 'q2', 'q3', 'q4'];
+
+// Preset offsets for the quick-pick chip (null = no deadline)
+const DEADLINE_PRESETS = [
+  { label: '今日', offset: 0  },
+  { label: '明日', offset: 1  },
+  { label: '今週', offset: 6  },
+  { label: 'なし', offset: null },
+];
+
+function offsetToDate(offset) {
+  if (offset === null) return null;
+  const d = new Date();
+  d.setDate(d.getDate() + offset);
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function fmtDate(iso) {
+  // "2026-05-15" → "5月15日"
+  const [, m, dd] = iso.split('-');
+  return `${parseInt(m)}月${parseInt(dd)}日`;
+}
+
+function msUntilMidnight() {
+  const now = new Date();
+  const midnight = new Date(now);
+  midnight.setHours(24, 0, 0, 0);
+  return midnight - now;
+}
+
+const ACCENT = '#b94328';
+const STORAGE_KEY  = 'gomai-tasks-v2';
+const DATE_KEY     = 'gomai-last-date';
+const DONE_CNT_KEY = 'gomai-completed';
+
+// ─── Persistence helpers ─────────────────────────────────────────────────────
+function todayStr() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function loadTasks() {
+  try {
+    // v2 key first
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+    // migrate from v1
+    const old = localStorage.getItem('gomai-tasks-v1');
+    if (old) {
+      const migrated = JSON.parse(old).map(migrateTask);
+      saveTasks(migrated);
+      return migrated;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function saveTasks(tasks) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks)); } catch (_) {}
+}
+
+function loadCompletedCount() {
+  return parseInt(localStorage.getItem(DONE_CNT_KEY) || '0', 10);
+}
+
+function saveCompletedCount(n) {
+  try { localStorage.setItem(DONE_CNT_KEY, String(n)); } catch (_) {}
+}
+
+// ─── Cache management ────────────────────────────────────────────────────────
+const MAX_TASKS = 300; // hard cap to prevent runaway growth
+
+function getStorageKB() {
+  try {
+    const keys = [STORAGE_KEY, DATE_KEY, DONE_CNT_KEY];
+    const bytes = keys.reduce((s, k) => s + ((localStorage.getItem(k) || '').length * 2), 0);
+    return (bytes / 1024).toFixed(1);
+  } catch (_) { return '?'; }
+}
+
+// Remove tasks that have been postponed 30+ times AND have no deadline
+// (they are clearly abandoned). Safe to call at any time.
+function pruneStale(tasks) {
+  return tasks.filter(t => !(!t.daily && (t.postponedFor || 0) >= 30 && !t.deadline));
+}
+
+// Cap total task count, keeping most-recently-created tasks
+function capTasks(tasks) {
+  if (tasks.length <= MAX_TASKS) return tasks;
+  return tasks.slice(0, MAX_TASKS);
+}
+
+// Auto-reset daily tasks on new day
+function checkDailyReset(tasks) {
+  const today = todayStr();
+  const last  = localStorage.getItem(DATE_KEY);
+  if (last !== today) {
+    localStorage.setItem(DATE_KEY, today);
+    return tasks.map(t => t.daily ? { ...t, doneToday: false } : t);
+  }
+  return tasks;
+}
+
+// ─── Deadline helper ─────────────────────────────────────────────────────────
+function deadlineMeta(deadline) {
+  if (!deadline) return null;
+  const today   = new Date(todayStr());
+  const target  = new Date(deadline);
+  const diffDays = Math.round((target - today) / 86400000);
+  if (diffDays < 0)  return { text: `${-diffDays}日超過 (${fmtDate(deadline)})`, color: ACCENT,  weight: 700 };
+  if (diffDays === 0) return { text: `今日まで (${fmtDate(deadline)})`,           color: ACCENT,  weight: 700 };
+  if (diffDays === 1) return { text: `明日まで (${fmtDate(deadline)})`,           color: ACCENT,  weight: 600 };
+  if (diffDays <= 7)  return { text: `あと${diffDays}日 (${fmtDate(deadline)})`,  color: C.muted, weight: 500 };
+  return                     { text: fmtDate(deadline),                           color: C.muted, weight: 500 };
+}
+
+// ─── Data migration (v1 daysLeft → v2 deadline) ──────────────────────────────
+function migrateTask(t) {
+  if ('daysLeft' in t && !('deadline' in t)) {
+    const dl = t.daysLeft;
+    const deadline = dl !== null && dl !== undefined ? offsetToDate(dl) : null;
+    const { daysLeft, ...rest } = t;
+    return { ...rest, deadline };
+  }
+  return t;
+}
+
+// ─── App ─────────────────────────────────────────────────────────────────────
+function App() {
+  const [tasks, setTasksRaw] = useState(() => {
+    const saved = loadTasks();
+    if (saved) return checkDailyReset(saved);
+    return [];
+  });
+  const [view,         setView]        = useState('list');
+  const [input,        setInput]       = useState('');
+  const [draftQ,       setDraftQ]      = useState('q1');
+  const [draftDL,      setDraftDL]     = useState(null);
+  const [draftDaily,   setDraftDaily]  = useState(false);
+  const [completedCnt, setCompletedCnt] = useState(loadCompletedCount);
+  const [leavingIds,   setLeavingIds]  = useState(new Set());
+  const [showExport,   setShowExport]  = useState(false);
+  const [, setTick] = useState(0); // 日付変更時の再レンダー用
+  const nextId = useRef(Date.now());
+
+  // 真夜中の自動更新 + タブ復帰時の更新
+  useEffect(() => {
+    let timer;
+    const onDayChange = () => {
+      setTasks(prev => checkDailyReset(prev));
+      setTick(t => t + 1);
+    };
+    const schedule = () => {
+      timer = setTimeout(() => { onDayChange(); schedule(); }, msUntilMidnight() + 100);
+    };
+    schedule();
+    const onVisible = () => { if (document.visibilityState === 'visible') onDayChange(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { clearTimeout(timer); document.removeEventListener('visibilitychange', onVisible); };
+  }, [setTasks]);
+
+  const setTasks = useCallback((fn) => {
+    setTasksRaw(prev => {
+      const next = typeof fn === 'function' ? fn(prev) : fn;
+      saveTasks(next);
+      return next;
+    });
+  }, []);
+
+  const addTask = () => {
+    const text = input.trim();
+    if (!text) return;
+    setTasks(prev => capTasks([{
+      id: nextId.current++,
+      text,
+      quadrant:    draftQ,
+      deadline:    draftDaily ? null : draftDL,
+      daily:       draftDaily,
+      doneToday:   draftDaily ? false : undefined,
+      postponedFor: 0,
+      createdAt:   Date.now(),
+    }, ...prev]));
+    setInput('');
+    setDraftDL(null);
+  };
+
+  const pruneAndSave = () => {
+    setTasks(prev => {
+      const pruned = pruneStale(prev);
+      return pruned;
+    });
+  };
+
+  const postpone = (id) => {
+    setTasks(prev => {
+      const task = prev.find(x => x.id === id);
+      if (!task) return prev;
+      return [...prev.filter(x => x.id !== id), {
+        ...task,
+        postponedFor: (task.postponedFor || 0) + 1,
+        // deadline は絶対日付なので後回しにしても変化しない
+      }];
+    });
+  };
+
+  const complete = (task) => {
+    if (leavingIds.has(task.id)) return;
+    setLeavingIds(prev => new Set(prev).add(task.id));
+    const newCnt = completedCnt + 1;
+    setCompletedCnt(newCnt);
+    saveCompletedCount(newCnt);
+    setTimeout(() => {
+      if (task.daily) {
+        setTasks(prev => prev.map(x => x.id === task.id ? { ...x, doneToday: true } : x));
+      } else {
+        setTasks(prev => prev.filter(x => x.id !== task.id));
+      }
+      setLeavingIds(prev => { const n = new Set(prev); n.delete(task.id); return n; });
+    }, 360);
+  };
+
+  const resetDaily = () => {
+    setTasks(prev => prev.map(x => x.daily ? { ...x, doneToday: false } : x));
+  };
+
+  const exportData = () => {
+    const data = JSON.stringify({ tasks, completedCnt, exportedAt: new Date().toISOString() }, null, 2);
+    const blob = new Blob([data], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url;
+    a.download = `gomai-tasks-${todayStr()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importData = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const parsed = JSON.parse(ev.target.result);
+        if (Array.isArray(parsed.tasks)) {
+          setTasks(parsed.tasks);
+          if (typeof parsed.completedCnt === 'number') {
+            setCompletedCnt(parsed.completedCnt);
+            saveCompletedCount(parsed.completedCnt);
+          }
+          setShowExport(false);
+        }
+      } catch (_) { alert('ファイルの読み込みに失敗しました'); }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  const activeNonDaily  = tasks.filter(x => !x.daily);
+  const pending         = activeNonDaily.length;
+  const dailyRemaining  = tasks.filter(x => x.daily && !x.doneToday).length;
+
+  return (
+    <div style={{
+      minHeight: '100dvh',
+      background: C.bg,
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'center',
+    }}>
+      <div style={{
+        width: '100%',
+        maxWidth: 480,
+        minHeight: '100dvh',
+        display: 'flex',
+        flexDirection: 'column',
+        paddingTop: 'env(safe-area-inset-top, 0px)',
+        paddingBottom: 'env(safe-area-inset-bottom, 0px)',
+      }}>
+
+        {/* ── Sticky header area ── */}
+        <div style={{ position: 'sticky', top: 0, zIndex: 20, background: C.bg }}>
+          <Header
+            pending={pending}
+            dailyRemaining={dailyRemaining}
+            completed={completedCnt}
+            onMenuClick={() => setShowExport(s => !s)}
+          />
+          <TabBar view={view} setView={setView}
+                  counts={{ list: pending, matrix: pending, daily: dailyRemaining }} />
+          <AddBar
+            value={input} onChange={setInput} onAdd={addTask}
+            quadrant={draftQ} setQuadrant={setDraftQ}
+            deadline={draftDL} setDeadline={setDraftDL}
+            daily={draftDaily} setDaily={setDraftDaily}
+          />
+        </div>
+
+        {/* ── Main content ── */}
+        <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+          {view === 'list'   && <ListView   tasks={activeNonDaily}
+                                            leavingIds={leavingIds}
+                                            onComplete={complete}
+                                            onPostpone={postpone} />}
+          {view === 'matrix' && <MatrixView tasks={activeNonDaily}
+                                            leavingIds={leavingIds}
+                                            onComplete={complete} />}
+          {view === 'daily'  && <DailyView  tasks={tasks.filter(x => x.daily)}
+                                            leavingIds={leavingIds}
+                                            onComplete={complete}
+                                            onReset={resetDaily} />}
+        </div>
+
+        {/* ── Export/Import drawer ── */}
+        {showExport && (
+          <ExportDrawer
+            onExport={exportData}
+            onImport={importData}
+            onPrune={pruneAndSave}
+            onClose={() => setShowExport(false)}
+            taskCount={tasks.length}
+            staleCount={tasks.filter(t => !t.daily && (t.postponedFor || 0) >= 30 && !t.deadline).length}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Header ──────────────────────────────────────────────────────────────────
+function Header({ pending, dailyRemaining, completed, onMenuClick }) {
+  return (
+    <div style={{
+      padding: '18px 20px 12px',
+      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    }}>
+      <div style={{
+        fontFamily: "'Noto Serif JP', serif",
+        fontSize: 22, fontWeight: 700, letterSpacing: '0.04em',
+        color: C.ink, lineHeight: 1,
+      }}>後回しタスク</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+        <MiniStat label="残り" value={pending} />
+        <MiniStat label="毎日" value={dailyRemaining} />
+        <MiniStat label="完了" value={completed} color={ACCENT} />
+        <button
+          onClick={onMenuClick}
+          aria-label="メニュー"
+          style={{
+            background: 'transparent', border: 'none', padding: '4px 2px',
+            cursor: 'pointer', color: C.muted, fontSize: 20, lineHeight: 1,
+          }}
+        >⋯</button>
+      </div>
+    </div>
+  );
+}
+
+function MiniStat({ label, value, color }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: 4 }}>
+      <span style={{
+        fontFamily: "'Noto Serif JP', serif",
+        fontSize: 17, fontWeight: 700, lineHeight: 1,
+        color: color || C.ink, fontVariantNumeric: 'tabular-nums',
+      }}>{value}</span>
+      <span style={{ fontSize: 10, color: C.muted, letterSpacing: '0.08em' }}>{label}</span>
+    </div>
+  );
+}
+
+// ─── Tab bar ─────────────────────────────────────────────────────────────────
+function TabBar({ view, setView, counts }) {
+  const tabs = [
+    { id: 'list',   label: 'リスト',     count: counts.list   },
+    { id: 'matrix', label: 'マトリクス', count: counts.matrix },
+    { id: 'daily',  label: '毎日',       count: counts.daily  },
+  ];
+  return (
+    <div style={{ margin: '0 16px 12px', display: 'flex', gap: 4 }}>
+      {tabs.map(tab => {
+        const active = view === tab.id;
+        return (
+          <button key={tab.id} onClick={() => setView(tab.id)} style={{
+            flex: 1, padding: '8px 0',
+            background: 'transparent', border: 'none',
+            borderBottom: `2px solid ${active ? C.ink : 'transparent'}`,
+            borderRadius: 0,
+            fontSize: 13, fontWeight: active ? 700 : 500,
+            color: active ? C.ink : C.muted,
+            cursor: 'pointer', letterSpacing: '0.04em',
+            fontFamily: 'inherit', whiteSpace: 'nowrap',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 5,
+          }}>
+            <span style={{ whiteSpace: 'nowrap' }}>{tab.label}</span>
+            <span style={{
+              fontSize: 11, color: C.muted,
+              fontFamily: "'Noto Serif JP', serif",
+              fontVariantNumeric: 'tabular-nums', fontWeight: 500,
+            }}>{tab.count}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Add bar ─────────────────────────────────────────────────────────────────
+function AddBar({ value, onChange, onAdd, quadrant, setQuadrant, deadline, setDeadline, daily, setDaily }) {
+  const hasValue = value.trim().length > 0;
+  return (
+    <div style={{ margin: '0 16px 10px' }}>
+      <div style={{
+        background: C.panel,
+        borderRadius: 12,
+        border: `1px solid ${C.rule}`,
+        padding: '4px 4px 4px 12px',
+        display: 'flex', alignItems: 'center', gap: 8,
+        boxShadow: '0 1px 4px rgba(0,0,0,0.05)',
+      }}>
+        <span style={{ color: C.soft, fontSize: 18, lineHeight: 1, fontWeight: 300 }}>+</span>
+        <input
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') onAdd(); }}
+          placeholder="タスクを書く"
+          style={{
+            flex: 1, border: 'none', outline: 'none', background: 'transparent',
+            fontSize: 15, fontFamily: 'inherit', color: C.ink,
+            padding: '10px 0', minWidth: 0,
+          }}
+        />
+        <button
+          onClick={onAdd}
+          disabled={!hasValue}
+          style={{
+            border: 'none', cursor: hasValue ? 'pointer' : 'default',
+            background: hasValue ? C.ink : 'transparent',
+            color: hasValue ? C.panel : C.soft,
+            fontSize: 12, fontFamily: 'inherit', fontWeight: 600,
+            padding: '8px 14px', borderRadius: 8,
+            transition: 'background 0.15s, color 0.15s',
+          }}
+        >追加</button>
+      </div>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 6,
+        padding: '7px 4px 0',
+      }}>
+        <QuadrantPicker value={quadrant} onChange={setQuadrant} disabled={daily} />
+        <DeadlineChip   value={deadline} onChange={setDeadline} disabled={daily} />
+        <div style={{ flex: 1 }} />
+        <DailyChip value={daily} onChange={setDaily} />
+      </div>
+    </div>
+  );
+}
+
+function QuadrantPicker({ value, onChange, disabled }) {
+  const cur = QUADRANTS[value];
+  const cycle = () => {
+    if (disabled) return;
+    const idx = Q_ORDER.indexOf(value);
+    onChange(Q_ORDER[(idx + 1) % Q_ORDER.length]);
+  };
+  return (
+    <button onClick={cycle} disabled={disabled} style={{
+      display: 'flex', alignItems: 'center', gap: 6,
+      padding: '4px 10px 4px 6px',
+      background: 'transparent', border: `1px solid ${C.rule}`, borderRadius: 999,
+      fontSize: 11, fontFamily: 'inherit', fontWeight: 600,
+      color: C.ink, cursor: disabled ? 'default' : 'pointer',
+      opacity: disabled ? 0.4 : 1,
+    }}>
+      <span style={{ width: 8, height: 8, borderRadius: 2, background: cur.color, display: 'block' }} />
+      <span style={{ color: cur.color }}>{cur.label}</span>
+    </button>
+  );
+}
+
+function DeadlineChip({ value, onChange, disabled }) {
+  const label = value ? fmtDate(value) : 'なし';
+  return (
+    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4, opacity: disabled ? 0.4 : 1 }}>
+      {/* 日付ピッカーを透明な input で覆う */}
+      <div style={{ position: 'relative' }}>
+        <div style={{
+          padding: '4px 10px',
+          background: 'transparent', border: `1px solid ${C.rule}`, borderRadius: 999,
+          fontSize: 11, fontFamily: 'inherit', fontWeight: 600,
+          color: value ? C.ink : C.muted,
+          cursor: disabled ? 'default' : 'pointer',
+          userSelect: 'none',
+        }}>
+          期限 · {label}
+        </div>
+        {!disabled && (
+          <input
+            type="date"
+            value={value || ''}
+            min={todayStr()}
+            onChange={e => onChange(e.target.value || null)}
+            style={{
+              position: 'absolute', inset: 0,
+              opacity: 0, cursor: 'pointer',
+              width: '100%', height: '100%',
+              border: 'none', padding: 0, margin: 0,
+            }}
+          />
+        )}
+      </div>
+      {value && !disabled && (
+        <button
+          onClick={() => onChange(null)}
+          style={{
+            width: 17, height: 17, borderRadius: '50%',
+            background: C.sunk, border: 'none',
+            fontSize: 10, color: C.muted, cursor: 'pointer',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            padding: 0, lineHeight: 1, fontFamily: 'inherit',
+          }}
+        >×</button>
+      )}
+    </div>
+  );
+}
+
+function DailyChip({ value, onChange }) {
+  return (
+    <button onClick={() => onChange(!value)} style={{
+      padding: '4px 10px',
+      background: value ? C.ink : 'transparent',
+      border: `1px solid ${value ? C.ink : C.rule}`, borderRadius: 999,
+      fontSize: 11, fontFamily: 'inherit', fontWeight: 600,
+      color: value ? C.panel : C.muted, cursor: 'pointer',
+    }}>毎日</button>
+  );
+}
+
+// ─── List view ───────────────────────────────────────────────────────────────
+function ListView({ tasks, leavingIds, onComplete, onPostpone }) {
+  return (
+    <div style={{ flex: 1, overflowY: 'auto', padding: '4px 16px 80px' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {tasks.map(task => (
+          <TaskCard
+            key={task.id} task={task}
+            leaving={leavingIds.has(task.id)}
+            onComplete={onComplete}
+            onPostpone={onPostpone}
+          />
+        ))}
+        {tasks.length === 0 && <EmptyState text="タスクはありません" />}
+      </div>
+    </div>
+  );
+}
+
+function TaskCard({ task, leaving, onComplete, onPostpone }) {
+  const meta = QUADRANTS[task.quadrant] || QUADRANTS.q1;
+  const dl   = deadlineMeta(task.deadline);
+  const aged = (task.postponedFor || 0) >= 7;
+  return (
+    <div
+      className={leaving ? 'task-leaving' : ''}
+      style={{
+        background: C.panel,
+        borderRadius: 10,
+        padding: '12px 12px 12px 14px',
+        display: 'flex', alignItems: 'center', gap: 11,
+        border: `1px solid ${C.rule}`,
+        borderLeft: `3px solid ${meta.color}`,
+      }}
+    >
+      <button
+        onClick={() => onComplete(task)}
+        aria-label="完了"
+        className="check-btn"
+        style={{
+          width: 22, height: 22, borderRadius: 11, padding: 0,
+          border: `1.5px solid ${C.soft}`, background: 'transparent',
+          cursor: 'pointer', flexShrink: 0,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          transition: 'background 0.15s',
+        }}
+      />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{
+          fontSize: 14.5, fontWeight: 500, lineHeight: 1.4,
+          color: C.ink, wordBreak: 'break-word',
+        }}>{task.text}</div>
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, marginTop: 4,
+          fontSize: 11, lineHeight: 1, fontVariantNumeric: 'tabular-nums',
+          flexWrap: 'nowrap', overflow: 'hidden',
+        }}>
+          <span style={{ color: meta.color, fontWeight: 600, whiteSpace: 'nowrap', flexShrink: 0 }}>{meta.label}</span>
+          {dl && <>
+            <Dot />
+            <span style={{ color: dl.color, fontWeight: dl.weight, whiteSpace: 'nowrap', flexShrink: 0 }}>{dl.text}</span>
+          </>}
+          {(task.postponedFor || 0) > 0 && <>
+            <Dot />
+            <span style={{
+              color: aged ? ACCENT : C.muted,
+              fontWeight: aged ? 700 : 500,
+              whiteSpace: 'nowrap', flexShrink: 0,
+            }}>{task.postponedFor}日 後回し</span>
+          </>}
+        </div>
+      </div>
+      <button
+        onClick={() => onPostpone(task.id)}
+        style={{
+          background: 'transparent', border: `1px solid ${C.rule}`,
+          padding: '5px 10px', borderRadius: 999,
+          fontSize: 11, fontFamily: 'inherit', fontWeight: 500,
+          color: C.muted, cursor: 'pointer', whiteSpace: 'nowrap',
+        }}
+      >後回し</button>
+    </div>
+  );
+}
+
+function Dot() {
+  return <span style={{ width: 2, height: 2, borderRadius: 1, background: C.soft, display: 'inline-block' }} />;
+}
+
+// ─── Matrix view ─────────────────────────────────────────────────────────────
+function MatrixView({ tasks, leavingIds, onComplete }) {
+  const byQ = useMemo(() => {
+    const o = { q1: [], q2: [], q3: [], q4: [] };
+    tasks.forEach(t => { (o[t.quadrant] || o.q1).push(t); });
+    Object.keys(o).forEach(k => o[k].sort((a, b) => {
+      const A = a.deadline || '9999-99-99';
+      const B = b.deadline || '9999-99-99';
+      return A < B ? -1 : A > B ? 1 : 0;
+    }));
+    return o;
+  }, [tasks]);
+
+  return (
+    <div style={{
+      flex: 1, minHeight: 0,
+      padding: '0 16px 80px',
+      display: 'grid',
+      gridTemplateColumns: '1fr 1fr',
+      gridTemplateRows: '1fr 1fr',
+      gap: 8,
+      minHeight: 400,
+    }}>
+      {Q_ORDER.map(q => (
+        <QuadrantCell key={q} q={q} tasks={byQ[q]}
+                      leavingIds={leavingIds} onComplete={onComplete} />
+      ))}
+    </div>
+  );
+}
+
+function QuadrantCell({ q, tasks, leavingIds, onComplete }) {
+  const meta = QUADRANTS[q];
+  return (
+    <div style={{
+      background: C.panel, borderRadius: 10,
+      border: `1px solid ${C.rule}`,
+      padding: '8px 8px 6px 10px',
+      display: 'flex', flexDirection: 'column',
+      minHeight: 0, minWidth: 0, overflow: 'hidden',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: meta.color }}>{meta.label}</div>
+        <div style={{
+          fontSize: 10, color: C.muted, fontVariantNumeric: 'tabular-nums',
+          fontFamily: "'Noto Serif JP', serif", fontWeight: 600,
+        }}>{tasks.length}</div>
+      </div>
+      <div style={{ fontSize: 9, color: C.muted, marginTop: 1, letterSpacing: '0.06em' }}>{meta.sub}</div>
+      <div style={{
+        flex: 1, minHeight: 0, overflowY: 'auto',
+        display: 'flex', flexDirection: 'column', gap: 4, marginTop: 7,
+      }}>
+        {tasks.map(t => (
+          <MatrixTask key={t.id} task={t} qColor={meta.color}
+                      leaving={leavingIds.has(t.id)} onComplete={onComplete} />
+        ))}
+        {tasks.length === 0 && (
+          <div style={{ fontSize: 10, color: C.soft, textAlign: 'center', padding: '12px 0' }}>—</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MatrixTask({ task, qColor, leaving, onComplete }) {
+  const dl = deadlineMeta(task.deadline);
+  return (
+    <div
+      onClick={() => onComplete(task)}
+      className={leaving ? 'task-leaving' : ''}
+      style={{
+        padding: '6px 7px', background: C.bg, borderRadius: 5,
+        borderLeft: `2px solid ${qColor}`, cursor: 'pointer',
+      }}
+    >
+      <div style={{
+        fontSize: 11.5, lineHeight: 1.2, color: C.ink, fontWeight: 500,
+        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+      }}>{task.text}</div>
+      {dl && (
+        <div style={{
+          fontSize: 9.5, color: dl.color, fontWeight: dl.weight, marginTop: 2,
+          fontVariantNumeric: 'tabular-nums',
+          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+        }}>{dl.text}</div>
+      )}
+    </div>
+  );
+}
+
+// ─── Daily view ──────────────────────────────────────────────────────────────
+function DailyView({ tasks, leavingIds, onComplete, onReset }) {
+  const done  = tasks.filter(x => x.doneToday).length;
+  const total = tasks.length;
+  const pct   = total ? done / total : 0;
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: '0 16px 80px' }}>
+      <div style={{
+        background: C.panel, border: `1px solid ${C.rule}`,
+        borderRadius: 10, padding: '10px 12px',
+        display: 'flex', alignItems: 'center', gap: 12,
+        marginBottom: 10,
+      }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 11, color: C.muted, letterSpacing: '0.08em', fontWeight: 500 }}>今日のルーティン</div>
+          <div style={{
+            fontSize: 15, fontWeight: 700, color: C.ink, marginTop: 3,
+            fontFamily: "'Noto Serif JP', serif", fontVariantNumeric: 'tabular-nums',
+          }}>{done} / {total} 完了</div>
+          <div style={{ height: 3, marginTop: 7, borderRadius: 2, background: C.sunk, overflow: 'hidden' }}>
+            <div style={{
+              width: `${pct * 100}%`, height: '100%',
+              background: pct === 1 ? '#3a8c5e' : C.ink,
+              transition: 'width 0.3s',
+            }} />
+          </div>
+        </div>
+        <button onClick={onReset} style={{
+          background: 'transparent', border: `1px solid ${C.rule}`,
+          padding: '6px 11px', borderRadius: 999,
+          fontSize: 11, color: C.muted, cursor: 'pointer',
+          fontFamily: 'inherit', fontWeight: 500, whiteSpace: 'nowrap',
+        }}>明日へ進む</button>
+      </div>
+      <div style={{ flex: 1, overflowY: 'auto' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {tasks.map(t => (
+            <DailyTask key={t.id} task={t} leaving={leavingIds.has(t.id)} onComplete={onComplete} />
+          ))}
+          {tasks.length === 0 && <EmptyState text="毎日のタスクはありません" />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DailyTask({ task, leaving, onComplete }) {
+  const meta = QUADRANTS[task.quadrant] || QUADRANTS.q2;
+  const done = task.doneToday;
+  return (
+    <div
+      className={leaving ? 'task-leaving' : ''}
+      style={{
+        background: done ? C.sunk : C.panel,
+        borderRadius: 10, padding: '11px 12px 11px 13px',
+        display: 'flex', alignItems: 'center', gap: 11,
+        border: `1px solid ${C.rule}`, borderLeft: `3px solid ${meta.color}`,
+        opacity: done ? 0.55 : 1, transition: 'opacity 0.2s',
+      }}
+    >
+      <button
+        onClick={() => !done && onComplete(task)}
+        aria-label="完了"
+        className={done ? '' : 'check-btn'}
+        style={{
+          width: 22, height: 22, borderRadius: 11, padding: 0,
+          border: `1.5px solid ${done ? meta.color : C.soft}`,
+          background: done ? meta.color : 'transparent',
+          cursor: done ? 'default' : 'pointer', flexShrink: 0,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          transition: 'all 0.15s',
+        }}
+      >
+        {done && (
+          <svg width="12" height="12" viewBox="0 0 13 13">
+            <path d="M2 7 L5 10 L11 3" stroke="#fff" strokeWidth="2"
+                  fill="none" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+        )}
+      </button>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{
+          fontSize: 14, fontWeight: 500, lineHeight: 1.4,
+          textDecoration: done ? 'line-through' : 'none',
+          textDecorationColor: C.soft,
+          wordBreak: 'break-word',
+        }}>{task.text}</div>
+        <div style={{
+          fontSize: 10.5, color: done ? '#3a8c5e' : meta.color,
+          marginTop: 2, fontWeight: 600,
+        }}>
+          {done ? '本日完了 · 明日また' : `${meta.label} · 毎日`}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Export/Import drawer ────────────────────────────────────────────────────
+function ExportDrawer({ onExport, onImport, onPrune, onClose, taskCount, staleCount }) {
+  const fileRef = useRef(null);
+  const kb = getStorageKB();
+  const nearCap = taskCount >= MAX_TASKS * 0.8;
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 100,
+      display: 'flex', flexDirection: 'column', justifyContent: 'flex-end',
+    }}>
+      <div onClick={onClose} style={{ flex: 1, background: 'rgba(0,0,0,0.25)' }} />
+      <div style={{
+        background: C.panel, borderRadius: '16px 16px 0 0',
+        padding: '20px 20px calc(20px + env(safe-area-inset-bottom, 0px))',
+        border: `1px solid ${C.rule}`,
+        boxShadow: '0 -4px 24px rgba(0,0,0,0.1)',
+        maxWidth: 480, width: '100%', alignSelf: 'center',
+      }}>
+        <div style={{
+          fontFamily: "'Noto Serif JP', serif",
+          fontSize: 16, fontWeight: 700, color: C.ink, marginBottom: 12,
+        }}>データの管理</div>
+
+        {/* Storage status bar */}
+        <div style={{
+          background: C.sunk, borderRadius: 10, padding: '10px 12px',
+          marginBottom: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        }}>
+          <span style={{ fontSize: 12, color: C.muted }}>
+            タスク数 <strong style={{ color: nearCap ? ACCENT : C.ink }}>{taskCount}</strong> / {MAX_TASKS}件
+          </span>
+          <span style={{ fontSize: 12, color: C.muted }}>
+            保存サイズ <strong style={{ color: C.ink }}>{kb} KB</strong>
+          </span>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {staleCount > 0 && (
+            <button
+              onClick={() => { onPrune(); onClose(); }}
+              style={{
+                padding: '12px', borderRadius: 10,
+                border: `1px solid ${ACCENT}`,
+                background: '#fff5f3', color: ACCENT, fontSize: 14,
+                fontFamily: 'inherit', fontWeight: 600, cursor: 'pointer', textAlign: 'left',
+              }}
+            >🗑 放置タスクを整理（{staleCount}件 — 30回以上後回しで期限なし）</button>
+          )}
+          <button
+            onClick={onExport}
+            style={{
+              padding: '12px', borderRadius: 10, border: `1px solid ${C.rule}`,
+              background: C.bg, color: C.ink, fontSize: 14, fontFamily: 'inherit',
+              fontWeight: 600, cursor: 'pointer', textAlign: 'left',
+            }}
+          >📥 JSONファイルで書き出す</button>
+          <button
+            onClick={() => fileRef.current?.click()}
+            style={{
+              padding: '12px', borderRadius: 10, border: `1px solid ${C.rule}`,
+              background: C.bg, color: C.ink, fontSize: 14, fontFamily: 'inherit',
+              fontWeight: 600, cursor: 'pointer', textAlign: 'left',
+            }}
+          >📤 JSONファイルを読み込む</button>
+          <input ref={fileRef} type="file" accept=".json,application/json"
+                 style={{ display: 'none' }} onChange={onImport} />
+        </div>
+
+        <p style={{ fontSize: 11, color: C.soft, margin: '12px 0 0', lineHeight: 1.6 }}>
+          データはこの端末のブラウザにのみ保存されます。他の端末と同期するにはJSONで書き出して読み込んでください。
+        </p>
+
+        <button
+          onClick={onClose}
+          style={{
+            marginTop: 12, width: '100%', padding: '11px',
+            borderRadius: 10, border: 'none',
+            background: C.sunk, color: C.muted, fontSize: 14,
+            fontFamily: 'inherit', fontWeight: 500, cursor: 'pointer',
+          }}
+        >閉じる</button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Empty state ─────────────────────────────────────────────────────────────
+function EmptyState({ text }) {
+  return (
+    <div style={{
+      padding: '40px 20px', textAlign: 'center', color: C.muted,
+      fontSize: 13, fontFamily: "'Noto Serif JP', serif", letterSpacing: '0.04em',
+    }}>{text}</div>
+  );
+}
+
+// ─── Mount ───────────────────────────────────────────────────────────────────
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

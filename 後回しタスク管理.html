@@ -16,7 +16,8 @@
     -webkit-font-smoothing: antialiased;
     overscroll-behavior: none;
   }
-  button { font-family: inherit; }
+  button { font-family: inherit; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+  input, select { -webkit-tap-highlight-color: transparent; }
   ::-webkit-scrollbar { width: 0; height: 0; }
 
   @keyframes task-out {
@@ -370,12 +371,14 @@ function App() {
           />
           <TabBar view={view} setView={setView}
                   counts={{ list: pending, matrix: pending, daily: dailyRemaining }} />
-          <AddBar
-            value={input} onChange={setInput} onAdd={addTask}
-            quadrant={draftQ} setQuadrant={setDraftQ}
-            deadline={draftDL} setDeadline={setDraftDL}
-            daily={draftDaily} setDaily={setDraftDaily}
-          />
+          {view !== 'flow' && (
+            <AddBar
+              value={input} onChange={setInput} onAdd={addTask}
+              quadrant={draftQ} setQuadrant={setDraftQ}
+              deadline={draftDL} setDeadline={setDraftDL}
+              daily={draftDaily} setDaily={setDraftDaily}
+            />
+          )}
         </div>
 
         {/* ── Main content ── */}
@@ -418,15 +421,15 @@ function App() {
 function Header({ pending, dailyRemaining, completed, onMenuClick }) {
   return (
     <div style={{
-      padding: '18px 20px 12px',
+      padding: '12px 16px 8px',
       display: 'flex', alignItems: 'center', justifyContent: 'space-between',
     }}>
       <div style={{
         fontFamily: "'Noto Serif JP', serif",
-        fontSize: 22, fontWeight: 700, letterSpacing: '0.04em',
+        fontSize: 20, fontWeight: 700, letterSpacing: '0.04em',
         color: C.ink, lineHeight: 1,
       }}>後回しタスク</div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
         <MiniStat label="残り" value={pending} />
         <MiniStat label="毎日" value={dailyRemaining} />
         <MiniStat label="完了" value={completed} color={ACCENT} />
@@ -434,7 +437,7 @@ function Header({ pending, dailyRemaining, completed, onMenuClick }) {
           onClick={onMenuClick}
           aria-label="メニュー"
           style={{
-            background: 'transparent', border: 'none', padding: '4px 2px',
+            background: 'transparent', border: 'none', padding: '8px 4px',
             cursor: 'pointer', color: C.muted, fontSize: 20, lineHeight: 1,
           }}
         >⋯</button>
@@ -465,20 +468,20 @@ function TabBar({ view, setView, counts }) {
     { id: 'flow',   label: 'フロー',     count: null          },
   ];
   return (
-    <div style={{ margin: '0 16px 12px', display: 'flex', gap: 4 }}>
+    <div style={{ margin: '0 16px 10px', display: 'flex', gap: 0 }}>
       {tabs.map(tab => {
         const active = view === tab.id;
         return (
           <button key={tab.id} onClick={() => setView(tab.id)} style={{
-            flex: 1, padding: '8px 0',
+            flex: 1, padding: '10px 2px',
             background: 'transparent', border: 'none',
-            borderBottom: `2px solid ${active ? C.ink : 'transparent'}`,
+            borderBottom: `2px solid ${active ? C.ink : C.rule}`,
             borderRadius: 0,
-            fontSize: 13, fontWeight: active ? 700 : 500,
+            fontSize: 12, fontWeight: active ? 700 : 500,
             color: active ? C.ink : C.muted,
-            cursor: 'pointer', letterSpacing: '0.04em',
+            cursor: 'pointer', letterSpacing: '0.03em',
             fontFamily: 'inherit', whiteSpace: 'nowrap',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 5,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4,
           }}>
             <span style={{ whiteSpace: 'nowrap' }}>{tab.label}</span>
             {tab.count !== null && <span style={{
@@ -702,14 +705,14 @@ function TaskCard({ task, leaving, onComplete, onDelete, onUpdateTask }) {
       }}
     >
       {/* ── メイン行 ── */}
-      <div style={{ padding: '12px 10px 12px 14px', display: 'flex', alignItems: 'center', gap: 10 }}>
+      <div style={{ padding: '10px 8px 10px 12px', display: 'flex', alignItems: 'center', gap: 10 }}>
         {/* 完了ボタン */}
         <button
           onClick={() => onComplete(task)}
           aria-label="完了"
           className="check-btn"
           style={{
-            width: 22, height: 22, borderRadius: 11, padding: 0,
+            width: 28, height: 28, borderRadius: 14, padding: 0,
             border: `1.5px solid ${C.soft}`, background: 'transparent',
             cursor: 'pointer', flexShrink: 0,
             display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -745,10 +748,10 @@ function TaskCard({ task, leaving, onComplete, onDelete, onUpdateTask }) {
             style={{
               background: expanded ? C.sunk : 'transparent',
               border: `1px solid ${C.rule}`, borderRadius: 999,
-              padding: '4px 8px', fontSize: 10, fontFamily: 'inherit',
+              padding: '6px 10px', fontSize: 10, fontFamily: 'inherit',
               color: subtasks.length > 0 ? C.ink : C.soft,
               cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3,
-              fontVariantNumeric: 'tabular-nums',
+              fontVariantNumeric: 'tabular-nums', minHeight: 30,
             }}
           >
             {subtasks.length > 0
@@ -761,8 +764,9 @@ function TaskCard({ task, leaving, onComplete, onDelete, onUpdateTask }) {
             onClick={() => onDelete(task.id)}
             aria-label="削除"
             style={{
-              background: 'transparent', border: 'none', padding: '4px 2px',
+              background: 'transparent', border: 'none', padding: '6px 4px',
               cursor: 'pointer', color: C.soft, fontSize: 15, lineHeight: 1,
+              minWidth: 32, minHeight: 32, display: 'flex', alignItems: 'center', justifyContent: 'center',
             }}
           >🗑</button>
         </div>
@@ -847,9 +851,9 @@ function MatrixView({ tasks, leavingIds, onComplete, onDelete, onMoveTask }) {
       padding: '0 16px 80px',
       display: 'grid',
       gridTemplateColumns: '1fr 1fr',
-      gridTemplateRows: '1fr 1fr',
+      gridAutoRows: 'minmax(120px, auto)',
       gap: 8,
-      minHeight: 400,
+      alignContent: 'start',
     }}>
       {Q_ORDER.map(q => (
         <QuadrantCell key={q} q={q} tasks={byQ[q]}
@@ -955,7 +959,7 @@ function MatrixTask({ task, qColor, leaving, onComplete, onDelete }) {
       </div>
       <button
         onClick={(e) => { e.stopPropagation(); onDelete(task.id); }}
-        style={{ background: 'none', border: 'none', color: C.soft, cursor: 'pointer', fontSize: 12, padding: '0 1px', lineHeight: 1, flexShrink: 0 }}
+        style={{ background: 'none', border: 'none', color: C.soft, cursor: 'pointer', fontSize: 12, padding: '4px', lineHeight: 1, flexShrink: 0, minWidth: 28, minHeight: 28, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
       >🗑</button>
     </div>
   );
@@ -1173,7 +1177,7 @@ function DailyTask({ task, leaving, onComplete, onDelete }) {
         aria-label="完了"
         className={done ? '' : 'check-btn'}
         style={{
-          width: 22, height: 22, borderRadius: 11, padding: 0,
+          width: 28, height: 28, borderRadius: 14, padding: 0,
           border: `1.5px solid ${done ? meta.color : C.soft}`,
           background: done ? meta.color : 'transparent',
           cursor: done ? 'default' : 'pointer', flexShrink: 0,

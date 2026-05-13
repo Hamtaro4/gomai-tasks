@@ -280,6 +280,14 @@ function App() {
     setTasks(prev => prev.map(x => x.daily ? { ...x, doneToday: false } : x));
   };
 
+  const deleteTask = (id) => {
+    setTasks(prev => prev.filter(x => x.id !== id));
+  };
+
+  const updateTask = useCallback((id, updater) => {
+    setTasks(prev => prev.map(t => t.id === id ? updater(t) : t));
+  }, [setTasks]);
+
   const exportData = () => {
     const data = JSON.stringify({ tasks, completedCnt, exportedAt: new Date().toISOString() }, null, 2);
     const blob = new Blob([data], { type: 'application/json' });
@@ -357,13 +365,17 @@ function App() {
           {view === 'list'   && <ListView   tasks={activeNonDaily}
                                             leavingIds={leavingIds}
                                             onComplete={complete}
-                                            onPostpone={postpone} />}
+                                            onPostpone={postpone}
+                                            onDelete={deleteTask}
+                                            onUpdateTask={updateTask} />}
           {view === 'matrix' && <MatrixView tasks={activeNonDaily}
                                             leavingIds={leavingIds}
-                                            onComplete={complete} />}
+                                            onComplete={complete}
+                                            onDelete={deleteTask} />}
           {view === 'daily'  && <DailyView  tasks={tasks.filter(x => x.daily)}
                                             leavingIds={leavingIds}
                                             onComplete={complete}
+                                            onDelete={deleteTask}
                                             onReset={resetDaily} />}
         </div>
 
@@ -594,7 +606,7 @@ function DailyChip({ value, onChange }) {
 }
 
 // ─── List view ───────────────────────────────────────────────────────────────
-function ListView({ tasks, leavingIds, onComplete, onPostpone }) {
+function ListView({ tasks, leavingIds, onComplete, onPostpone, onDelete, onUpdateTask }) {
   return (
     <div style={{ flex: 1, overflowY: 'auto', padding: '4px 16px 80px' }}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -604,6 +616,8 @@ function ListView({ tasks, leavingIds, onComplete, onPostpone }) {
             leaving={leavingIds.has(task.id)}
             onComplete={onComplete}
             onPostpone={onPostpone}
+            onDelete={onDelete}
+            onUpdateTask={onUpdateTask}
           />
         ))}
         {tasks.length === 0 && <EmptyState text="タスクはありません" />}
@@ -612,68 +626,176 @@ function ListView({ tasks, leavingIds, onComplete, onPostpone }) {
   );
 }
 
-function TaskCard({ task, leaving, onComplete, onPostpone }) {
-  const meta = QUADRANTS[task.quadrant] || QUADRANTS.q1;
-  const dl   = deadlineMeta(task.deadline);
-  const aged = (task.postponedFor || 0) >= 7;
+function TaskCard({ task, leaving, onComplete, onPostpone, onDelete, onUpdateTask }) {
+  const [expanded, setExpanded] = useState(false);
+  const [subInput, setSubInput] = useState('');
+
+  const meta     = QUADRANTS[task.quadrant] || QUADRANTS.q1;
+  const dl       = deadlineMeta(task.deadline);
+  const aged     = (task.postponedFor || 0) >= 7;
+  const subtasks = task.subtasks || [];
+  const subDone  = subtasks.filter(s => s.done).length;
+
+  const addSubtask = () => {
+    const text = subInput.trim();
+    if (!text) return;
+    onUpdateTask(task.id, t => ({
+      ...t,
+      subtasks: [...(t.subtasks || []), { id: Date.now(), text, done: false }],
+    }));
+    setSubInput('');
+  };
+
+  const toggleSubtask = (subId) => {
+    onUpdateTask(task.id, t => ({
+      ...t,
+      subtasks: (t.subtasks || []).map(s => s.id === subId ? { ...s, done: !s.done } : s),
+    }));
+  };
+
+  const deleteSubtask = (subId) => {
+    onUpdateTask(task.id, t => ({
+      ...t,
+      subtasks: (t.subtasks || []).filter(s => s.id !== subId),
+    }));
+  };
+
   return (
     <div
       className={leaving ? 'task-leaving' : ''}
       style={{
         background: C.panel,
         borderRadius: 10,
-        padding: '12px 12px 12px 14px',
-        display: 'flex', alignItems: 'center', gap: 11,
         border: `1px solid ${C.rule}`,
         borderLeft: `3px solid ${meta.color}`,
+        overflow: 'hidden',
       }}
     >
-      <button
-        onClick={() => onComplete(task)}
-        aria-label="完了"
-        className="check-btn"
-        style={{
-          width: 22, height: 22, borderRadius: 11, padding: 0,
-          border: `1.5px solid ${C.soft}`, background: 'transparent',
-          cursor: 'pointer', flexShrink: 0,
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          transition: 'background 0.15s',
-        }}
-      />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{
-          fontSize: 14.5, fontWeight: 500, lineHeight: 1.4,
-          color: C.ink, wordBreak: 'break-word',
-        }}>{task.text}</div>
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 8, marginTop: 4,
-          fontSize: 11, lineHeight: 1, fontVariantNumeric: 'tabular-nums',
-          flexWrap: 'nowrap', overflow: 'hidden',
-        }}>
-          <span style={{ color: meta.color, fontWeight: 600, whiteSpace: 'nowrap', flexShrink: 0 }}>{meta.label}</span>
-          {dl && <>
-            <Dot />
-            <span style={{ color: dl.color, fontWeight: dl.weight, whiteSpace: 'nowrap', flexShrink: 0 }}>{dl.text}</span>
-          </>}
-          {(task.postponedFor || 0) > 0 && <>
-            <Dot />
-            <span style={{
-              color: aged ? ACCENT : C.muted,
-              fontWeight: aged ? 700 : 500,
-              whiteSpace: 'nowrap', flexShrink: 0,
-            }}>{task.postponedFor}日 後回し</span>
-          </>}
+      {/* ── メイン行 ── */}
+      <div style={{ padding: '12px 10px 12px 14px', display: 'flex', alignItems: 'center', gap: 10 }}>
+        {/* 完了ボタン */}
+        <button
+          onClick={() => onComplete(task)}
+          aria-label="完了"
+          className="check-btn"
+          style={{
+            width: 22, height: 22, borderRadius: 11, padding: 0,
+            border: `1.5px solid ${C.soft}`, background: 'transparent',
+            cursor: 'pointer', flexShrink: 0,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            transition: 'background 0.15s',
+          }}
+        />
+
+        {/* テキスト + メタ */}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 14.5, fontWeight: 500, lineHeight: 1.4, color: C.ink, wordBreak: 'break-word' }}>
+            {task.text}
+          </div>
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8, marginTop: 4,
+            fontSize: 11, lineHeight: 1, fontVariantNumeric: 'tabular-nums',
+            flexWrap: 'nowrap', overflow: 'hidden',
+          }}>
+            <span style={{ color: meta.color, fontWeight: 600, whiteSpace: 'nowrap', flexShrink: 0 }}>{meta.label}</span>
+            {dl && <><Dot /><span style={{ color: dl.color, fontWeight: dl.weight, whiteSpace: 'nowrap', flexShrink: 0 }}>{dl.text}</span></>}
+            {(task.postponedFor || 0) > 0 && <><Dot /><span style={{ color: aged ? ACCENT : C.muted, fontWeight: aged ? 700 : 500, whiteSpace: 'nowrap', flexShrink: 0 }}>{task.postponedFor}日 後回し</span></>}
+          </div>
+        </div>
+
+        {/* 右ボタン群 */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+          {/* サブタスク展開トグル */}
+          <button
+            onClick={() => setExpanded(e => !e)}
+            style={{
+              background: expanded ? C.sunk : 'transparent',
+              border: `1px solid ${C.rule}`, borderRadius: 999,
+              padding: '4px 8px', fontSize: 10, fontFamily: 'inherit',
+              color: subtasks.length > 0 ? C.ink : C.soft,
+              cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3,
+              fontVariantNumeric: 'tabular-nums',
+            }}
+          >
+            {subtasks.length > 0
+              ? <><span style={{ fontWeight: 600 }}>{subDone}/{subtasks.length}</span><span style={{ fontSize: 9 }}>{expanded ? '▲' : '▼'}</span></>
+              : <span style={{ fontSize: 11 }}>＋</span>
+            }
+          </button>
+          {/* 後回しボタン */}
+          <button
+            onClick={() => onPostpone(task.id)}
+            style={{
+              background: 'transparent', border: `1px solid ${C.rule}`,
+              padding: '4px 9px', borderRadius: 999,
+              fontSize: 11, fontFamily: 'inherit', fontWeight: 500,
+              color: C.muted, cursor: 'pointer', whiteSpace: 'nowrap',
+            }}
+          >後回し</button>
+          {/* 削除ボタン */}
+          <button
+            onClick={() => onDelete(task.id)}
+            aria-label="削除"
+            style={{
+              background: 'transparent', border: 'none', padding: '4px 2px',
+              cursor: 'pointer', color: C.soft, fontSize: 15, lineHeight: 1,
+            }}
+          >🗑</button>
         </div>
       </div>
-      <button
-        onClick={() => onPostpone(task.id)}
-        style={{
-          background: 'transparent', border: `1px solid ${C.rule}`,
-          padding: '5px 10px', borderRadius: 999,
-          fontSize: 11, fontFamily: 'inherit', fontWeight: 500,
-          color: C.muted, cursor: 'pointer', whiteSpace: 'nowrap',
-        }}
-      >後回し</button>
+
+      {/* ── サブタスク欄（展開時） ── */}
+      {expanded && (
+        <div style={{ borderTop: `1px solid ${C.rule}`, padding: '8px 12px 10px 40px' }}>
+          {subtasks.map(s => (
+            <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+              <button
+                onClick={() => toggleSubtask(s.id)}
+                style={{
+                  width: 18, height: 18, borderRadius: 9, padding: 0, flexShrink: 0,
+                  border: `1.5px solid ${s.done ? meta.color : C.soft}`,
+                  background: s.done ? meta.color : 'transparent',
+                  cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  transition: 'all 0.15s',
+                }}
+              >
+                {s.done && <svg width="10" height="10" viewBox="0 0 13 13"><path d="M2 7 L5 10 L11 3" stroke="#fff" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+              </button>
+              <span style={{
+                flex: 1, fontSize: 13, color: s.done ? C.muted : C.ink,
+                textDecoration: s.done ? 'line-through' : 'none',
+                textDecorationColor: C.soft, lineHeight: 1.4,
+              }}>{s.text}</span>
+              <button
+                onClick={() => deleteSubtask(s.id)}
+                style={{ background: 'none', border: 'none', color: C.soft, cursor: 'pointer', fontSize: 14, padding: '0 2px', lineHeight: 1 }}
+              >×</button>
+            </div>
+          ))}
+          {/* サブタスク追加 */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: subtasks.length > 0 ? 6 : 0 }}>
+            <div style={{ width: 18, height: 18, borderRadius: 9, border: `1.5px dashed ${C.soft}`, flexShrink: 0 }} />
+            <input
+              value={subInput}
+              onChange={e => setSubInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') addSubtask(); }}
+              placeholder="サブタスクを追加…"
+              style={{
+                flex: 1, border: 'none', outline: 'none', background: 'transparent',
+                fontSize: 13, fontFamily: 'inherit', color: C.ink,
+                padding: '2px 0',
+              }}
+            />
+            {subInput.trim() && (
+              <button onClick={addSubtask} style={{
+                background: C.ink, color: C.panel, border: 'none',
+                borderRadius: 6, padding: '3px 9px', fontSize: 11,
+                fontFamily: 'inherit', fontWeight: 600, cursor: 'pointer',
+              }}>追加</button>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -683,7 +805,7 @@ function Dot() {
 }
 
 // ─── Matrix view ─────────────────────────────────────────────────────────────
-function MatrixView({ tasks, leavingIds, onComplete }) {
+function MatrixView({ tasks, leavingIds, onComplete, onDelete }) {
   const byQ = useMemo(() => {
     const o = { q1: [], q2: [], q3: [], q4: [] };
     tasks.forEach(t => { (o[t.quadrant] || o.q1).push(t); });
@@ -707,13 +829,13 @@ function MatrixView({ tasks, leavingIds, onComplete }) {
     }}>
       {Q_ORDER.map(q => (
         <QuadrantCell key={q} q={q} tasks={byQ[q]}
-                      leavingIds={leavingIds} onComplete={onComplete} />
+                      leavingIds={leavingIds} onComplete={onComplete} onDelete={onDelete} />
       ))}
     </div>
   );
 }
 
-function QuadrantCell({ q, tasks, leavingIds, onComplete }) {
+function QuadrantCell({ q, tasks, leavingIds, onComplete, onDelete }) {
   const meta = QUADRANTS[q];
   return (
     <div style={{
@@ -737,7 +859,7 @@ function QuadrantCell({ q, tasks, leavingIds, onComplete }) {
       }}>
         {tasks.map(t => (
           <MatrixTask key={t.id} task={t} qColor={meta.color}
-                      leaving={leavingIds.has(t.id)} onComplete={onComplete} />
+                      leaving={leavingIds.has(t.id)} onComplete={onComplete} onDelete={onDelete} />
         ))}
         {tasks.length === 0 && (
           <div style={{ fontSize: 10, color: C.soft, textAlign: 'center', padding: '12px 0' }}>—</div>
@@ -747,34 +869,45 @@ function QuadrantCell({ q, tasks, leavingIds, onComplete }) {
   );
 }
 
-function MatrixTask({ task, qColor, leaving, onComplete }) {
-  const dl = deadlineMeta(task.deadline);
+function MatrixTask({ task, qColor, leaving, onComplete, onDelete }) {
+  const dl       = deadlineMeta(task.deadline);
+  const subtasks = task.subtasks || [];
+  const subDone  = subtasks.filter(s => s.done).length;
   return (
     <div
-      onClick={() => onComplete(task)}
       className={leaving ? 'task-leaving' : ''}
       style={{
         padding: '6px 7px', background: C.bg, borderRadius: 5,
-        borderLeft: `2px solid ${qColor}`, cursor: 'pointer',
+        borderLeft: `2px solid ${qColor}`,
+        display: 'flex', alignItems: 'flex-start', gap: 4,
       }}
     >
-      <div style={{
-        fontSize: 11.5, lineHeight: 1.2, color: C.ink, fontWeight: 500,
-        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-      }}>{task.text}</div>
-      {dl && (
+      <div style={{ flex: 1, minWidth: 0, cursor: 'pointer' }} onClick={() => onComplete(task)}>
         <div style={{
-          fontSize: 9.5, color: dl.color, fontWeight: dl.weight, marginTop: 2,
-          fontVariantNumeric: 'tabular-nums',
+          fontSize: 11.5, lineHeight: 1.2, color: C.ink, fontWeight: 500,
           whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-        }}>{dl.text}</div>
-      )}
+        }}>{task.text}</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 }}>
+          {dl && <span style={{
+            fontSize: 9.5, color: dl.color, fontWeight: dl.weight,
+            fontVariantNumeric: 'tabular-nums',
+            whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+          }}>{dl.text}</span>}
+          {subtasks.length > 0 && <span style={{
+            fontSize: 9, color: C.muted, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap',
+          }}>{subDone}/{subtasks.length}</span>}
+        </div>
+      </div>
+      <button
+        onClick={(e) => { e.stopPropagation(); onDelete(task.id); }}
+        style={{ background: 'none', border: 'none', color: C.soft, cursor: 'pointer', fontSize: 12, padding: '0 1px', lineHeight: 1, flexShrink: 0 }}
+      >🗑</button>
     </div>
   );
 }
 
 // ─── Daily view ──────────────────────────────────────────────────────────────
-function DailyView({ tasks, leavingIds, onComplete, onReset }) {
+function DailyView({ tasks, leavingIds, onComplete, onDelete, onReset }) {
   const done  = tasks.filter(x => x.doneToday).length;
   const total = tasks.length;
   const pct   = total ? done / total : 0;
@@ -810,7 +943,7 @@ function DailyView({ tasks, leavingIds, onComplete, onReset }) {
       <div style={{ flex: 1, overflowY: 'auto' }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
           {tasks.map(t => (
-            <DailyTask key={t.id} task={t} leaving={leavingIds.has(t.id)} onComplete={onComplete} />
+            <DailyTask key={t.id} task={t} leaving={leavingIds.has(t.id)} onComplete={onComplete} onDelete={onDelete} />
           ))}
           {tasks.length === 0 && <EmptyState text="毎日のタスクはありません" />}
         </div>
@@ -819,7 +952,7 @@ function DailyView({ tasks, leavingIds, onComplete, onReset }) {
   );
 }
 
-function DailyTask({ task, leaving, onComplete }) {
+function DailyTask({ task, leaving, onComplete, onDelete }) {
   const meta = QUADRANTS[task.quadrant] || QUADRANTS.q2;
   const done = task.doneToday;
   return (
@@ -827,8 +960,8 @@ function DailyTask({ task, leaving, onComplete }) {
       className={leaving ? 'task-leaving' : ''}
       style={{
         background: done ? C.sunk : C.panel,
-        borderRadius: 10, padding: '11px 12px 11px 13px',
-        display: 'flex', alignItems: 'center', gap: 11,
+        borderRadius: 10, padding: '11px 10px 11px 13px',
+        display: 'flex', alignItems: 'center', gap: 10,
         border: `1px solid ${C.rule}`, borderLeft: `3px solid ${meta.color}`,
         opacity: done ? 0.55 : 1, transition: 'opacity 0.2s',
       }}
@@ -857,16 +990,20 @@ function DailyTask({ task, leaving, onComplete }) {
         <div style={{
           fontSize: 14, fontWeight: 500, lineHeight: 1.4,
           textDecoration: done ? 'line-through' : 'none',
-          textDecorationColor: C.soft,
-          wordBreak: 'break-word',
+          textDecorationColor: C.soft, wordBreak: 'break-word',
         }}>{task.text}</div>
-        <div style={{
-          fontSize: 10.5, color: done ? '#3a8c5e' : meta.color,
-          marginTop: 2, fontWeight: 600,
-        }}>
+        <div style={{ fontSize: 10.5, color: done ? '#3a8c5e' : meta.color, marginTop: 2, fontWeight: 600 }}>
           {done ? '本日完了 · 明日また' : `${meta.label} · 毎日`}
         </div>
       </div>
+      <button
+        onClick={() => onDelete(task.id)}
+        aria-label="削除"
+        style={{
+          background: 'transparent', border: 'none', padding: '4px 2px',
+          cursor: 'pointer', color: C.soft, fontSize: 15, lineHeight: 1, flexShrink: 0,
+        }}
+      >🗑</button>
     </div>
   );
 }
